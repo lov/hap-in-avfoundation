@@ -1,4 +1,5 @@
 #import "AVAssetWriterHapInput.h"
+#import <Accelerate/Accelerate.h>
 #include "HapPlatform.h"
 #import "HapCodecSubTypes.h"
 #import "PixelFormats.h"
@@ -32,6 +33,7 @@ NSString *const			AVVideoCodecHapQ = @"HapY";
 NSString *const			AVVideoCodecHapQAlpha = @"HapM";
 NSString *const			AVVideoCodecHapAlphaOnly = @"HapA";
 NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
+NSString *const			AVFallbackFPSKey = @"AVFallbackFPSKey";
 
 #define FourCCLog(n,f) NSLog(@"%@, %c%c%c%c",n,(int)((f>>24)&0xFF),(int)((f>>16)&0xFF),(int)((f>>8)&0xFF),(int)((f>>0)&0xFF))
 
@@ -60,12 +62,19 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 		}
 	}
 	//	make sure the CMMemoryPool used by this framework exists
-	OSSpinLockLock(&_HIAVFMemPoolLock);
+	os_unfair_lock_lock(&_HIAVFMemPoolLock);
 	if (_HIAVFMemPool==NULL)
 		_HIAVFMemPool = CMMemoryPoolCreate(NULL);
 	if (_HIAVFMemPoolAllocator==NULL)
 		_HIAVFMemPoolAllocator = CMMemoryPoolGetAllocator(_HIAVFMemPool);
-	OSSpinLockUnlock(&_HIAVFMemPoolLock);
+	os_unfair_lock_unlock(&_HIAVFMemPoolLock);
+}
+- (id) initWithMediaType:(AVMediaType)mediaType outputSettings:(NSDictionary<NSString *,id> *)outputSettings	{
+	NSLog(@"**** ERR: DO NOT USE THIS INIT METHOD (%s)",__func__);
+	NSLog(@"AVFoundation does not officially recognize the Hap codec");
+	NSLog(@"Please use -[AVAssetWriterHapInput initWithOutputSettings:] instead");
+	[self release];
+	return nil;
 }
 - (id) initWithOutputSettings:(NSDictionary *)n	{
 	self = [super initWithMediaType:AVMediaTypeVideo outputSettings:nil];
@@ -91,9 +100,9 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 		dxtBufferBytesPerRow[0] = 0;
 		dxtBufferBytesPerRow[1] = 0;
 		hapBufferPoolLength = 0;
-		encoderLock = OS_SPINLOCK_INIT;
+		encoderLock = OS_UNFAIR_LOCK_INIT;
 		glDXTEncoder = NULL;
-		encoderProgressLock = OS_SPINLOCK_INIT;
+		encoderProgressLock = OS_UNFAIR_LOCK_INIT;
 		encoderProgressFrames = [[NSMutableArray arrayWithCapacity:0] retain];
 		encoderWaitingToRunOut = NO;
 		lastEncodedDuration = kCMTimeZero;
@@ -175,6 +184,9 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 		exportChunkCounts[0] = (chunkNum==nil) ? 1 : [chunkNum intValue];
 		exportChunkCounts[0] = fmaxl(fminl(exportChunkCounts[0], HAPQMAXCHUNKS), 1);
 		exportChunkCounts[1] = exportChunkCounts[0];
+		//	if there's a default FPS key, use it
+		NSNumber		*fallbackFPSNum = (propertiesDict==nil) ? nil : [n objectForKey:AVFallbackFPSKey];
+		fallbackFPS = (fallbackFPSNum==nil) ? 0.0 : [fallbackFPSNum doubleValue];
 		
 		//	figure out the max dxt frame size in bytes
 		NSUInteger		dxtFrameSizeInBytes[2];
@@ -313,19 +325,19 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 		dispatch_release(encodeQueue);
 		encodeQueue = NULL;
 	}
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	if (encoderProgressFrames!=nil)	{
 		[encoderProgressFrames release];
 		encoderProgressFrames = nil;
 	}
-	OSSpinLockUnlock(&encoderProgressLock);
-	OSSpinLockLock(&encoderLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderLock);
 	//	release the DXT encoder
 	if (glDXTEncoder!=NULL)	{
 		HapCodecDXTEncoderDestroy((HapCodecDXTEncoderRef)glDXTEncoder);
 		glDXTEncoder = NULL;
 	}
-	OSSpinLockUnlock(&encoderLock);
+	os_unfair_lock_unlock(&encoderLock);
 	[super dealloc];
 }
 - (BOOL) appendPixelBuffer:(CVPixelBufferRef)pb withPresentationTime:(CMTime)t	{
@@ -351,7 +363,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 	
 	//	if i'm done accepting samples (because something marked me as finished), i won't be encoding a frame- but i'll still want to execute the block
 	__block HapEncoderFrame		*encoderFrame = nil;
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	if (encoderWaitingToRunOut)	{
 		if (pb!=NULL)	{
 			NSLog(@"\t\tERR: can't append pixel buffer, marked as finished and waiting for in-flight tasks to complete");
@@ -367,7 +379,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 			[encoderFrame release];
 		}
 	}
-	OSSpinLockUnlock(&encoderProgressLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
 	
 	//	retain the pixel buffer i was passed- i'll release it in the block (on the GCD-controlled thread)
 	if (pb!=NULL)
@@ -375,35 +387,71 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 	
 	
 	//	assemble a block that will encode the passed pixel buffer- i'll either be dispatching this block (via GCD) or executing it immediately...
-	void			(^encodeBlock)() = ^(){
+    void			(^encodeBlock)(void) = ^(){
 		//NSLog(@"%s",__func__);
 		//	if there's a pixel buffer to encode, let's take care of that first
 		if (pb!=NULL)	{
-			//	lock the base address of the pixel buffer, get a ptr to the raw pixel data- i'll either be converting it or encoding it
+			//	lock the base address of the pixel buffer
 			CVPixelBufferLockBaseAddress(pb,kHapCodecCVPixelBufferLockFlags);
 			
+			//	get the size of the image in the cvpixelbuffer, we need to compare it to the export size to determine if we need to do a resize...
+			NSSize			pbSize = NSMakeSize(CVPixelBufferGetWidth(pb),CVPixelBufferGetHeight(pb));
+			
+			//	get a ptr to the raw pixel data- i'll either be resizing/converting it or encoding this ptr.
 			void			*sourceBuffer = CVPixelBufferGetBaseAddress(pb);
 			size_t			sourceBufferBytesPerRow = CVPixelBufferGetBytesPerRow(pb);
+			
+			//	allocate the resize buffer if i need it
+			void			*resizeBuffer = nil;
+			if (!NSEqualSizes(pbSize, exportImgSize))	{
+				//	make a vImage struct for the pixel buffer we were passed
+				vImage_Buffer		pbImage = {
+					.data = sourceBuffer,
+					.height = pbSize.height,
+					.width = pbSize.width,
+					.rowBytes = sourceBufferBytesPerRow
+				};
+				//	make the resize buffer
+				size_t			resizeBufferSize = encoderInputPxlFmtBytesPerRow[0] * exportImgSize.height;
+				resizeBuffer = CFAllocatorAllocate(_HIAVFMemPoolAllocator, resizeBufferSize, 0);
+				//	make a vImage struct for the resize buffer we just allocated
+				vImage_Buffer		resizeImage = {
+					.data = resizeBuffer,
+					.height = exportImgSize.height,
+					.width = exportImgSize.width,
+					.rowBytes = encoderInputPxlFmtBytesPerRow[0]
+				};
+				//	scale the pixel buffer's vImage to the resize buffer's vImage
+				vImage_Error		vErr = vImageScale_ARGB8888(&pbImage, &resizeImage, NULL, kvImageHighQualityResampling | kvImageDoNotTile);
+				if (vErr != kvImageNoError)
+					NSLog(@"\t\terr %ld scaling image in %s",vErr,__func__);
+				else	{
+					//	update the sourceBuffer- we just resized the buffer we were passed, so it should have the same pixel format
+					sourceBuffer = resizeImage.data;
+					sourceBufferBytesPerRow = resizeImage.rowBytes;
+				}
+			}
+			
+			//	allocate any format conversion buffers i may need
 			void			*_formatConvertBuffers[2];
 			_formatConvertBuffers[0] = nil;
 			_formatConvertBuffers[1] = nil;
 			void			**formatConvertBuffers = _formatConvertBuffers;	//	this exists because we can't refer to arrays on the stack from within blocks
-			
-			//	allocate any format conversion buffers i may need
 			for (int i=0; i<exportPixelFormatsCount; ++i)	{
 				if (sourceFormat != encoderInputPxlFmts[i])	{
 					formatConvertBuffers[i] = CFAllocatorAllocate(_HIAVFMemPoolAllocator, formatConvertPoolLengths[i], 0);
 				}
 			}
+			
 			//	allocate the DXT buffer (or buffers) i'll be creating
 			void			*dxtBuffer = CFAllocatorAllocate(_HIAVFMemPoolAllocator, dxtBufferPoolLengths[0], 0);
 			void			*dxtAlphaBuffer = NULL;
 			__block int		intErr = 0;
 			//	try to get the default GL-based DXT encoder- if it exists we need to use it (and it's shared)
-			OSSpinLockLock(&encoderLock);
+			os_unfair_lock_lock(&encoderLock);
 			void			*targetDXTEncoder = glDXTEncoder;
 			void			*targetAlphaEncoder = NULL;
-			OSSpinLockUnlock(&encoderLock);
+			os_unfair_lock_unlock(&encoderLock);
 			void			*newDXTEncoder = NULL;
 			void			*newAlphaEncoder = NULL;
 			//	if we aren't sharing a GL-based DXT encoder, we need to make a new DXT encoder (which will be freed after this frame is encoded)
@@ -521,7 +569,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 				if (targetDXTEncoder != NULL)	{
 					//	if we haven't created a new DXT encoder then we're using the GL encoder, which is shared- and must thus be locked
 					if (newDXTEncoder == NULL)
-						OSSpinLockLock(&encoderLock);
+						os_unfair_lock_lock(&encoderLock);
 					//	slightly different path depending on whether i'm converting the passed pixel buffer...
 					if (formatConvertBuffers[0]==nil)	{
 						intErr = ((HapCodecDXTEncoderRef)targetDXTEncoder)->encode_function(targetDXTEncoder,
@@ -543,7 +591,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 							(unsigned int)thisSliceHeight);
 					}
 					if (newDXTEncoder == NULL)
-						OSSpinLockUnlock(&encoderLock);
+						os_unfair_lock_unlock(&encoderLock);
 				}
 				
 				//	if it exists, encode the data from the alpha plane for this slice as DXT data
@@ -636,9 +684,19 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 							else	{
 								//	make a CMFormatDescriptionRef that will describe the frame i'm supplying
 								CMFormatDescriptionRef		desc = NULL;
+                                int depth;
+                                switch (exportCodecType) {
+                                    case kHapAlphaCodecSubType:
+                                    case kHapYCoCgACodecSubType:
+                                        depth = 32;
+                                        break;
+                                    default:
+                                        depth = 24;
+                                        break;
+                                }
 								NSDictionary				*bufferExtensions = [NSDictionary dictionaryWithObjectsAndKeys:
 									[NSNumber numberWithDouble:2.199996948242188], kCMFormatDescriptionExtension_GammaLevel,
-									[NSNumber numberWithInt:((exportCodecType==kHapAlphaCodecSubType)?32:24)],kCMFormatDescriptionExtension_Depth,
+									[NSNumber numberWithInt:depth],kCMFormatDescriptionExtension_Depth,
 									@"Hap",kCMFormatDescriptionExtension_FormatName,
 									[NSNumber numberWithInt:2], kCMFormatDescriptionExtension_RevisionLevel,
 									[NSNumber numberWithInt:512], kCMFormatDescriptionExtension_SpatialQuality,
@@ -690,6 +748,10 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 			if (dxtAlphaBuffer!=nil)	{
 				CFAllocatorDeallocate(_HIAVFMemPoolAllocator, dxtAlphaBuffer);
 				dxtAlphaBuffer = nil;
+			}
+			if (resizeBuffer != nil)	{
+				CFAllocatorDeallocate(_HIAVFMemPoolAllocator, resizeBuffer);
+				resizeBuffer = nil;
 			}
 			if (formatConvertBuffers[0]!=nil)	{
 				CFAllocatorDeallocate(_HIAVFMemPoolAllocator, formatConvertBuffers[0]);
@@ -774,34 +836,34 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 }
 - (BOOL) finishedEncoding	{
 	BOOL		returnMe = NO;
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	if ([encoderProgressFrames count]==0)
 		returnMe = YES;
-	OSSpinLockUnlock(&encoderProgressLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
 	return returnMe;
 }
 - (void) finishEncoding	{
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	BOOL			needsToEncodeMore = NO;
 	if (encoderWaitingToRunOut || [encoderProgressFrames count]>0)
 		needsToEncodeMore = YES;
-	OSSpinLockUnlock(&encoderProgressLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
 	
 	if (needsToEncodeMore)
 		[self appendEncodedFrames];
 }
 - (void)markAsFinished	{
 	//NSLog(@"%s",__func__);
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	encoderWaitingToRunOut = YES;
-	OSSpinLockUnlock(&encoderProgressLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
 	//	append any encoded frames- if there are frames left over that aren't done encoding yet, this does nothing.  if there aren't any frames left over, it marks the input as finished.
 	[self appendEncodedFrames];
 }
 - (BOOL) isReadyForMoreMediaData	{
 	BOOL		returnMe = [super isReadyForMoreMediaData];
 	if (returnMe)	{
-		OSSpinLockLock(&encoderProgressLock);
+		os_unfair_lock_lock(&encoderProgressLock);
 		if (encoderWaitingToRunOut)	{
 			//NSLog(@"\t\tpretending i'm not ready for more data, waiting to run out- %s",__func__);
 			returnMe = NO;
@@ -810,7 +872,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 			//NSLog(@"\t\ttoo many frames waiting to be appended, not ready- %s",__func__);
 			returnMe = NO;
 		}
-		OSSpinLockUnlock(&encoderProgressLock);
+		os_unfair_lock_unlock(&encoderProgressLock);
 	}
 	return returnMe;
 }
@@ -821,11 +883,11 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 - (void) appendEncodedFrames	{
 	//NSLog(@"%s",__func__);
 	
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	if (![super isReadyForMoreMediaData])	{
 		NSLog(@"\t\terr: not ready for more media data, %s",__func__);
 		[encoderProgressFrames removeAllObjects];
-		OSSpinLockUnlock(&encoderProgressLock);
+		os_unfair_lock_unlock(&encoderProgressLock);
 		
 		[super markAsFinished];
 	}
@@ -845,11 +907,28 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 				markAsFinished = YES;
 			}
 		}
-		OSSpinLockUnlock(&encoderProgressLock);
+		os_unfair_lock_unlock(&encoderProgressLock);
 		
 		if (lastFrame != nil)	{
 			//	make a hap sample buffer, append it
-			CMSampleBufferRef	hapSampleBuffer = [lastFrame allocCMSampleBufferWithDurationTimeValue:[self lastEncodedDuration].value];
+			CMSampleBufferRef	hapSampleBuffer = NULL;
+			CMTime				tmpTime = [self lastEncodedDuration];
+			//	if there's no 'lastEncodedDuration'...
+			if (tmpTime.value == 0)	{
+				//	try to use the fallback FPS- if there isn't one, just use a value of 1...
+				if (fallbackFPS <= 0.0)	{
+					hapSampleBuffer = [lastFrame allocCMSampleBufferWithDurationTimeValue:1];
+				}
+				//	else there's a fallback FPS- calculate an appropriate time value given the fallback FPS and the last frame's timescale
+				else	{
+					hapSampleBuffer = [lastFrame allocCMSampleBufferWithDurationTimeValue:(int)round((1.0/fallbackFPS) / (1.0/(double)[lastFrame presentationTime].timescale))];
+				}
+			}
+			//	else there's a 'lastEncodedDuration'- use it...
+			else	{
+				hapSampleBuffer = [lastFrame allocCMSampleBufferWithDurationTimeValue:tmpTime.value];
+			}
+			
 			if (hapSampleBuffer==NULL)
 				NSLog(@"\t\terr: couldn't make sample buffer from frame duration, %s",__func__);
 			else	{
@@ -872,12 +951,12 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 	}
 	//	else i'm either not waiting to run out, or there's more than one frame in the array...
 	else	{
-		OSSpinLockUnlock(&encoderProgressLock);
+		os_unfair_lock_unlock(&encoderProgressLock);
 		
 		//	we want to add as many samples as possible
 		while ([super isReadyForMoreMediaData])	{
 			//	get the first two frames- if they're both encoded then i can append the first frame
-			OSSpinLockLock(&encoderProgressLock);
+			os_unfair_lock_lock(&encoderProgressLock);
 			HapEncoderFrame		*thisFrame = nil;
 			HapEncoderFrame		*nextFrame = nil;
 			if ([encoderProgressFrames count]>1)	{
@@ -893,7 +972,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 					[encoderProgressFrames removeObjectAtIndex:0];
 				}
 			}
-			OSSpinLockUnlock(&encoderProgressLock);
+			os_unfair_lock_unlock(&encoderProgressLock);
 			
 			//	if we don't have any frames to work with, break out of the while loop- there's nothing for us to append
 			if (thisFrame==nil || nextFrame==nil)
@@ -929,7 +1008,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 }
 - (void *) allocDXTEncoder	{
 	void			*returnMe = NULL;
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	switch (exportCodecType)	{
 	case kHapCodecSubType:
 	case kHapAlphaCodecSubType:
@@ -951,13 +1030,13 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 		NSLog(@"\t\terr: couldn't make encoder, %s",__func__);
 		FourCCLog(@"\t\texport codec type was",exportCodecType);
 	}
-	OSSpinLockUnlock(&encoderProgressLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
 	return returnMe;
 }
 - (void *) allocAlphaEncoder	{
 	//	note: only create and return an alpha encoder if appropriate (if i should be exporting a discrete alpha channel)
 	void			*returnMe = NULL;
-	OSSpinLockLock(&encoderProgressLock);
+	os_unfair_lock_lock(&encoderProgressLock);
 	switch (exportCodecType)	{
 	case kHapCodecSubType:
 	case kHapAlphaCodecSubType:
@@ -974,7 +1053,7 @@ NSString *const			AVHapVideoChunkCountKey = @"AVHapVideoChunkCountKey";
 		NSLog(@"\t\terr: couldn't make encoder, %s",__func__);
 		FourCCLog(@"\t\texport codec type was",exportCodecType);
 	}
-	OSSpinLockUnlock(&encoderProgressLock);
+	os_unfair_lock_unlock(&encoderProgressLock);
 	return returnMe;
 }
 

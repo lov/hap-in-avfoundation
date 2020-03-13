@@ -19,8 +19,8 @@ void HapMTDecode(HapDecodeWorkFunction function, void *p, unsigned int count, vo
 	});
 }
 #define FourCCLog(n,f) NSLog(@"%@, %c%c%c%c",n,(int)((f>>24)&0xFF),(int)((f>>16)&0xFF),(int)((f>>8)&0xFF),(int)((f>>0)&0xFF))
-#define LOCK OSSpinLockLock
-#define UNLOCK OSSpinLockUnlock
+#define LOCK os_unfair_lock_lock
+#define UNLOCK os_unfair_lock_unlock
 #define MAXDECODETIMES 6
 #define MAXDECODEFRAMES 3
 #define MAXDECODINGFRAMES 3
@@ -86,7 +86,7 @@ void HapMTDecode(HapDecodeWorkFunction function, void *p, unsigned int count, vo
 - (id) init	{
 	self = [super init];
 	if (self!=nil)	{
-		propertyLock = OS_SPINLOCK_INIT;
+		propertyLock = OS_UNFAIR_LOCK_INIT;
 		decodeQueue = NULL;
 		track = nil;
 		gen = nil;
@@ -393,8 +393,14 @@ void HapMTDecode(HapDecodeWorkFunction function, void *p, unsigned int count, vo
 				?	NULL
 				:	CFDataCreateWithBytesNoCopy(NULL, rgbMem, rgbPoolLength, _HIAVFMemPoolAllocator);
 			[newDecoderFrame setUserInfo:[NSArray arrayWithObjects:(NSData *)dxtDataRef, (dxtAlphaDataRef==NULL)?(id)[NSNull null]:(NSData *)dxtAlphaDataRef, (rgbDataRef==NULL)?[NSNull null]:(NSData *)rgbDataRef, nil]];
-			CFRelease(dxtDataRef);
-			CFRelease(rgbDataRef);
+			if (dxtDataRef != NULL)	{
+				CFRelease(dxtDataRef);
+				dxtDataRef = NULL;
+			}
+			if (rgbDataRef != NULL)	{
+				CFRelease(rgbDataRef);
+				rgbDataRef = NULL;
+			}
 		}
 		else	{
 			CFDataRef		dxtDataRef = CFDataCreateWithBytesNoCopy(NULL, dxtMem[0], dxtPoolLengths[0], _HIAVFMemPoolAllocator);
@@ -696,7 +702,7 @@ void HapMTDecode(HapDecodeWorkFunction function, void *p, unsigned int count, vo
 					//	else it's a "normal" (non-YCoCg) DXT texture format, use the GL decoder
 					else if (dxtTextureFormats[0]==HapTextureFormat_RGB_DXT1 || dxtTextureFormats[0]==HapTextureFormat_RGBA_DXT5)	{
 						//	make a GL decoder
-						void			*glDecoder = HapCodecGLCreateDecoder(imgSize.width, imgSize.height, dxtTextureFormats[0]);
+						void			*glDecoder = HapCodecGLCreateDecoder(dxtImgSize.width, dxtImgSize.height, dxtTextureFormats[0]);
 						if (glDecoder != NULL)	{
 							//	decode the DXT data into the rgb buffer
 							//NSLog(@"\t\tcalling %ld with userInfo %@",rgbDataSize/(NSUInteger)dxtImgSize.height,[n userInfo]);
@@ -1001,6 +1007,33 @@ void HapMTDecode(HapDecodeWorkFunction function, void *p, unsigned int count, vo
 	if (n == NULL)
 		return nil;
 	return [self allocFrameForTime:CMSampleBufferGetPresentationTimeStamp(n)];
+}
+
+- (HapDecoderFrame *) findFrameClosestToTime:(CMTime)n    {
+    HapDecoderFrame            *returnMe = nil;
+    LOCK(&propertyLock);
+    if (track==nil || gen==nil)    {
+        UNLOCK(&propertyLock);
+        return returnMe;
+    }
+    for (HapDecoderFrame *frame in playedOutFrames)    {
+        if ([frame containsTime:n])    {
+            returnMe = [frame retain];
+            returnMe = [frame autorelease];
+            UNLOCK(&propertyLock);
+            return returnMe;
+        }
+    }
+    for (HapDecoderFrame *frame in decodedFrames)    {
+        if ([frame containsTime:n])    {
+            returnMe = [frame retain];
+            returnMe = [frame autorelease];
+            UNLOCK(&propertyLock);
+            return returnMe;
+        }
+    }
+    UNLOCK(&propertyLock);
+    return returnMe;
 }
 
 #pragma mark -
